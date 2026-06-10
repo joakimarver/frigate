@@ -1,5 +1,5 @@
 """Fallback detector plugin — tries a primary detector and falls back to a
-secondary one if the primary is unavailable or returns all-zero results.
+secondary one if the primary raises an exception (e.g. a ZMQ timeout).
 
 This allows a remote GPU inference server (via the ``zmq`` detector) to be
 configured as the primary detector with a local CPU/GPU detector as the
@@ -27,6 +27,14 @@ Example ``config.yml``::
    two **other** detectors defined in the same ``detectors:`` block.  Those
    referenced detectors are instantiated *inside* the fallback; they do not
    get their own separate processes.
+
+Failure detection
+-----------------
+The fallback switches to the secondary **only on exceptions** raised by the
+primary (e.g. a ZMQ timeout or connection error).  An all-zero detection
+array is *not* treated as a failure because it is the normal result when no
+objects are present in the frame — using it as a failure signal would cause
+constant primary/secondary ping-ponging on cameras monitoring empty scenes.
 """
 
 import logging
@@ -159,20 +167,7 @@ class FallbackDetector(DetectionApi):
             return self._zero_result
 
         try:
-            result = active.detect_raw(tensor_input)
-            # A fully-zero result from the primary (e.g. ZMQ timeout) is treated
-            # as a failure signal so we can switch to secondary promptly.
-            if self._using_primary and np.all(result == 0):
-                logger.warning(
-                    "FallbackDetector: primary %r returned all-zero detections — "
-                    "switching to secondary %r",
-                    self._config.primary,
-                    self._config.secondary,
-                )
-                self._using_primary = False
-                self._last_health_check = time.monotonic()
-                return self._run_secondary(tensor_input)
-            return result
+            return active.detect_raw(tensor_input)
         except Exception as exc:
             if self._using_primary:
                 logger.error(

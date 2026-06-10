@@ -114,7 +114,7 @@ class ServerHealth:
                 "requests_total": self._requests_total,
                 "inference_total": self._inference_total,
                 "mean_latency_ms": round(mean_latency, 2),
-                "loaded_models": list(self._store._runners.keys()),  # noqa: SLF001
+                "loaded_models": self._store.loaded_model_names(),
             }
 
 
@@ -183,7 +183,7 @@ def _handle_inference(
 
     model_name: str = header.get("model_name", "")
     if not model_name:
-        loaded = list(store._runners.keys())  # noqa: SLF001
+        loaded = store.loaded_model_names()
         if not loaded:
             logger.warning("No model loaded — returning zeros")
             return _encode_detections(_ZERO_RESULT)

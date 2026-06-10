@@ -32,11 +32,15 @@ from __future__ import annotations
 
 import logging
 import threading
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from inference_server.server import ServerHealth
 
 logger = logging.getLogger(__name__)
 
 
-def start_health_server(health: object, port: int) -> None:
+def start_health_server(health: ServerHealth, port: int) -> None:
     """Start the FastAPI health server in a background daemon thread.
 
     Args:

@@ -2,6 +2,7 @@
 
 import logging
 import os
+import threading
 
 import numpy as np
 
@@ -15,13 +16,27 @@ class ModelStore:
     ONNX-based runner on demand.  The store is also responsible for
     creating and returning a :class:`~inference_server.runners.onnx_runner.OnnxRunner`
     for each model.
+
+    Thread-safety notes
+    -------------------
+    ``_runners`` is a plain ``dict`` accessed from multiple worker threads.
+    Under CPython the GIL makes individual ``dict`` operations (``get``,
+    assignment) effectively atomic, so workers reading ``_runners.get()``
+    concurrently with a hot-swap ``save_and_load`` assignment are safe.
+    However, iterating over ``_runners`` while another thread may add a key
+    is **not** safe without a lock.  Use :meth:`loaded_model_names` (which
+    takes a snapshot inside a lock) whenever you need to enumerate keys.
+    During a hot-swap a worker may still hold a reference to the *old*
+    runner; that is intentional — in-flight requests complete normally
+    before the old runner is garbage-collected.
     """
 
     def __init__(self, model_dir: str, device: str) -> None:
         self._model_dir = model_dir
         self._device = device
-        # name -> OnnxRunner instance
+        # name -> OnnxRunner instance; guarded by _runners_lock for iteration
         self._runners: dict[str, object] = {}
+        self._runners_lock = threading.Lock()
         os.makedirs(model_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -53,6 +68,14 @@ class ModelStore:
 
     def is_loaded(self, model_name: str) -> bool:
         return model_name in self._runners
+
+    def loaded_model_names(self) -> list[str]:
+        """Return a snapshot of currently loaded model names.
+
+        Thread-safe: acquires the iteration lock before copying the keys.
+        """
+        with self._runners_lock:
+            return list(self._runners.keys())
 
     def save_and_load(self, model_name: str, model_bytes: bytes) -> bool:
         """Persist *model_bytes* to disk and load it into a runner.
@@ -116,7 +139,8 @@ class ModelStore:
 
         try:
             runner = OnnxRunner(path, self._device)
-            self._runners[model_name] = runner
+            with self._runners_lock:
+                self._runners[model_name] = runner
             logger.info("Loaded model %s on device=%s", model_name, self._device)
             return True
         except Exception as exc:

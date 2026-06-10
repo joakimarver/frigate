@@ -329,8 +329,10 @@ In-flight inference requests using the old model complete normally before the ne
 The `fallback` plugin in Frigate handles automatic switching:
 
 1. **Normal operation**: All frames are sent to the primary (remote GPU).
-2. **Primary failure**: If the primary returns all-zero detections or raises an error, Frigate switches to the secondary (local CPU/GPU) and logs a warning.
+2. **Primary failure**: If the primary raises an exception (e.g. a ZMQ timeout when the remote server is unreachable), Frigate switches to the secondary (local CPU/GPU) and logs an error.
 3. **Recovery**: Every `health_check_interval_s` seconds (default: 30), Frigate tries the primary again. If it succeeds, it stays on primary; if it fails, it immediately returns to secondary.
+
+> **Note:** The fallback triggers on *exceptions* only, not on all-zero detection results. An all-zero result is the normal response when no objects are present in the frame — treating it as a failure would cause constant primary/secondary switching on cameras monitoring empty scenes.
 
 ```yaml
 detectors:
