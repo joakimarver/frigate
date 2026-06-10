@@ -1,0 +1,23 @@
+# Frigate Remote Inference Server — Requirements
+#
+# Core dependencies (always required)
+pyzmq>=25.0
+numpy>=1.24
+opencv-python-headless>=4.8   # provides cv2.dnn.NMSBoxes for post-processing
+
+# ONNX Runtime — choose ONE of the variants below depending on your hardware:
+#
+#   CPU only (any platform):
+#     onnxruntime>=1.17
+#
+#   NVIDIA GPU — Linux or Windows (CUDA 11/12):
+#     onnxruntime-gpu>=1.17
+#
+#   AMD / Intel GPU — Windows only (DirectML):
+#     onnxruntime-directml>=1.17
+#
+# The install scripts automatically select the right variant.
+# If you are installing manually, uncomment just ONE line:
+# onnxruntime>=1.17
+# onnxruntime-gpu>=1.17
+# onnxruntime-directml>=1.17

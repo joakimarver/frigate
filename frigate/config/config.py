@@ -758,6 +758,36 @@ class FrigateConfig(FrigateBaseModel):
             detector_config.model = model
             self.detectors[key] = detector_config
 
+        # Wire up fallback detector references after all detector configs are resolved.
+        # For each "fallback" detector, look up its primary and secondary detector
+        # configs by name and attach them as private attributes so that
+        # FallbackDetector.__init__ can instantiate them.
+        for key, detector_config in self.detectors.items():
+            if detector_config.type == "fallback":
+                primary_name: str = getattr(detector_config, "primary", "")
+                secondary_name: str = getattr(detector_config, "secondary", "")
+
+                primary_cfg = self.detectors.get(primary_name)
+                secondary_cfg = self.detectors.get(secondary_name)
+
+                if primary_cfg is None:
+                    logger.error(
+                        "Fallback detector %r references unknown primary %r",
+                        key,
+                        primary_name,
+                    )
+                if secondary_cfg is None:
+                    logger.error(
+                        "Fallback detector %r references unknown secondary %r",
+                        key,
+                        secondary_name,
+                    )
+
+                # Attach configs as runtime attributes (Pydantic allows extra attributes
+                # because BaseDetectorConfig uses ConfigDict(extra="allow")).
+                detector_config._primary_config = primary_cfg  # type: ignore[attr-defined]
+                detector_config._secondary_config = secondary_cfg  # type: ignore[attr-defined]
+
         for name, camera in self.cameras.items():
             modified_global_config = global_config.copy()
 
