@@ -28,11 +28,28 @@ class ModelStore:
     # Public helpers
     # ------------------------------------------------------------------
 
+    def _safe_model_name(self, model_name: str) -> str:
+        """Return a sanitized filename, rejecting any path-traversal attempts.
+
+        Only the basename is kept.  Raises ``ValueError`` if the sanitized name
+        is empty or attempts to escape ``model_dir``.
+        """
+        safe = os.path.basename(model_name)
+        if not safe:
+            raise ValueError(f"Invalid model name: {model_name!r}")
+        resolved = os.path.realpath(os.path.join(self._model_dir, safe))
+        if not resolved.startswith(os.path.realpath(self._model_dir) + os.sep):
+            raise ValueError(f"Path traversal detected for model name: {model_name!r}")
+        return safe
+
     def model_path(self, model_name: str) -> str:
-        return os.path.join(self._model_dir, model_name)
+        return os.path.join(self._model_dir, self._safe_model_name(model_name))
 
     def is_available(self, model_name: str) -> bool:
-        return os.path.isfile(self.model_path(model_name))
+        try:
+            return os.path.isfile(self.model_path(model_name))
+        except ValueError:
+            return False
 
     def is_loaded(self, model_name: str) -> bool:
         return model_name in self._runners
@@ -42,7 +59,12 @@ class ModelStore:
 
         Returns True on success, False on any failure.
         """
-        path = self.model_path(model_name)
+        try:
+            path = self.model_path(model_name)
+        except ValueError as exc:
+            logger.error("Rejected unsafe model name: %s", exc)
+            return False
+
         try:
             with open(path, "wb") as fh:
                 fh.write(model_bytes)
@@ -58,7 +80,12 @@ class ModelStore:
 
         Returns True on success, False if the file does not exist or loading fails.
         """
-        path = self.model_path(model_name)
+        try:
+            path = self.model_path(model_name)
+        except ValueError as exc:
+            logger.error("Rejected unsafe model name: %s", exc)
+            return False
+
         if not os.path.isfile(path):
             return False
         return self._load(model_name, path)

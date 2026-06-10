@@ -3,7 +3,7 @@
 
 Each function returns a numpy array of shape (20, 6) where each row is:
     [class_id, confidence, y_min_norm, x_min_norm, y_max_norm, x_max_norm]
-with coordinates normalised to [0, 1] relative to the model input dimensions.
+with coordinates normalized to [0, 1] relative to the model input dimensions.
 
 These functions are ported verbatim from ``frigate/util/model.py`` so that
 the remote inference server produces identical results to the embedded Frigate
@@ -180,65 +180,83 @@ def _post_process_multipart_yolo(
     width: int,
     height: int,
 ) -> np.ndarray:
-    anchors = [
-        [(12, 16), (19, 36), (40, 28)],
-        [(36, 75), (76, 55), (72, 146)],
-        [(142, 110), (192, 243), (459, 401)],
+    anchors_per_scale = [
+        np.array([(12, 16), (19, 36), (40, 28)], dtype=np.float32),
+        np.array([(36, 75), (76, 55), (72, 146)], dtype=np.float32),
+        np.array([(142, 110), (192, 243), (459, 401)], dtype=np.float32),
     ]
     stride_map = {0: 8, 1: 16, 2: 32}
 
-    all_boxes: list[list[float]] = []
-    all_scores: list[float] = []
-    all_class_ids: list[int] = []
+    all_boxes: list[np.ndarray] = []
+    all_scores: list[np.ndarray] = []
+    all_class_ids: list[np.ndarray] = []
 
     for i, output in enumerate(output_list):
         bs, _, ny, nx = output.shape
         stride = stride_map[i]
-        anchor_set = anchors[i]
+        anchor_set = anchors_per_scale[i]  # (3, 2)
         num_anchors = len(anchor_set)
+
+        # Reshape to (num_anchors, ny, nx, 85)
         output = output.reshape(bs, num_anchors, 85, ny, nx)
-        output = output.transpose(0, 1, 3, 4, 2)[0]
+        output = output.transpose(0, 1, 3, 4, 2)[0]  # (num_anchors, ny, nx, 85)
 
-        for a_idx, (anchor_w, anchor_h) in enumerate(anchor_set):
-            for y in range(ny):
-                for x in range(nx):
-                    pred = output[a_idx, y, x]
-                    class_probs = pred[5:]
-                    class_id = int(np.argmax(class_probs))
-                    class_conf = class_probs[class_id]
-                    conf = float(class_conf * pred[4])
+        # Build grid coordinates — shape (ny, nx, 2)
+        xv, yv = np.meshgrid(np.arange(nx), np.arange(ny))
+        grid = np.stack([xv, yv], axis=-1).astype(np.float32)  # (ny, nx, 2)
 
-                    if conf < _CONF_THRESHOLD:
-                        continue
+        # Decode box centres: (anchor, ny, nx)
+        pred_xy = output[..., :2]  # (A, ny, nx, 2)
+        pred_wh = output[..., 2:4]
+        objectness = output[..., 4]  # (A, ny, nx)
+        class_probs = output[..., 5:]  # (A, ny, nx, num_classes)
 
-                    bx = ((float(pred[0]) * 2.0 - 0.5) + x) * stride
-                    by = ((float(pred[1]) * 2.0 - 0.5) + y) * stride
-                    bw = ((float(pred[2]) * 2.0) ** 2) * anchor_w
-                    bh = ((float(pred[3]) * 2.0) ** 2) * anchor_h
+        bx = ((pred_xy[..., 0] * 2.0 - 0.5) + grid[:, :, 0]) * stride
+        by = ((pred_xy[..., 1] * 2.0 - 0.5) + grid[:, :, 1]) * stride
 
-                    x1 = max(0.0, bx - bw / 2)
-                    y1 = max(0.0, by - bh / 2)
-                    x2 = min(float(width), bx + bw / 2)
-                    y2 = min(float(height), by + bh / 2)
+        # anchor_set[:, 0] -> (A,) broadcast to (A, ny, nx)
+        bw = ((pred_wh[..., 0] * 2.0) ** 2) * anchor_set[:, 0, np.newaxis, np.newaxis]
+        bh = ((pred_wh[..., 1] * 2.0) ** 2) * anchor_set[:, 1, np.newaxis, np.newaxis]
 
-                    all_boxes.append([x1, y1, x2, y2])
-                    all_scores.append(conf)
-                    all_class_ids.append(class_id)
+        class_conf = np.max(class_probs, axis=-1)  # (A, ny, nx)
+        class_id = np.argmax(class_probs, axis=-1)  # (A, ny, nx)
+        conf = class_conf * objectness  # (A, ny, nx)
+
+        # Filter by confidence
+        mask = conf >= _CONF_THRESHOLD
+        if not np.any(mask):
+            continue
+
+        x1 = np.clip(bx[mask] - bw[mask] / 2, 0.0, float(width))
+        y1 = np.clip(by[mask] - bh[mask] / 2, 0.0, float(height))
+        x2 = np.clip(bx[mask] + bw[mask] / 2, 0.0, float(width))
+        y2 = np.clip(by[mask] + bh[mask] / 2, 0.0, float(height))
+
+        all_boxes.append(np.stack([x1, y1, x2, y2], axis=-1))
+        all_scores.append(conf[mask])
+        all_class_ids.append(class_id[mask])
+
+    if not all_boxes:
+        return np.zeros((20, 6), np.float32)
+
+    all_boxes_np = np.concatenate(all_boxes, axis=0).tolist()
+    all_scores_np = np.concatenate(all_scores, axis=0).tolist()
+    all_class_ids_np = np.concatenate(all_class_ids, axis=0)
 
     indices = cv2.dnn.NMSBoxes(
-        bboxes=all_boxes,
-        scores=all_scores,
+        bboxes=all_boxes_np,
+        scores=all_scores_np,
         score_threshold=_CONF_THRESHOLD,
         nms_threshold=_NMS_THRESHOLD,
     )
 
     results = np.zeros((20, 6), np.float32)
     if len(indices) > 0:
-        for i, idx in enumerate(indices.flatten()[:20]):
-            class_id = all_class_ids[idx]
-            conf = all_scores[idx]
-            x1, y1, x2, y2 = all_boxes[idx]
-            results[i] = [
+        for out_idx, idx in enumerate(indices.flatten()[:20]):
+            class_id = int(all_class_ids_np[idx])
+            conf = float(all_scores_np[idx])
+            x1, y1, x2, y2 = all_boxes_np[idx]
+            results[out_idx] = [
                 class_id,
                 conf,
                 y1 / height,

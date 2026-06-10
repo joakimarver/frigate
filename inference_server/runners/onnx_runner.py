@@ -17,6 +17,7 @@ import numpy as np
 import onnxruntime as ort
 
 from inference_server.runners.post_process import (
+    _CONF_THRESHOLD,
     post_process_dfine,
     post_process_rfdetr,
     post_process_yolo,
@@ -225,14 +226,14 @@ def _post_process_ssd(
 ) -> np.ndarray:
     """Handle SSD-style models with separate boxes/classes/scores outputs."""
     # Typical output order for TFLite SSD: boxes, classes, scores, num_detections
-    boxes = np.squeeze(output[0])  # (N, 4) [y_min, x_min, y_max, x_max] normalised
+    boxes = np.squeeze(output[0])  # (N, 4) [y_min, x_min, y_max, x_max] normalized
     classes = np.squeeze(output[1])  # (N,)
     scores = np.squeeze(output[2])  # (N,)
 
     detections = np.zeros((20, 6), np.float32)
     det_idx = 0
     for i in range(min(len(scores), 20)):
-        if scores[i] < 0.4:
+        if scores[i] < _CONF_THRESHOLD:
             break
         detections[det_idx] = [
             classes[i],

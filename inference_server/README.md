@@ -206,7 +206,7 @@ sudo systemctl status frigate-inference
 
 ---
 
-## Fallback Detector Behaviour
+## Fallback Detector Behavior
 
 The `fallback` plugin in Frigate handles automatic switching:
 
@@ -323,7 +323,7 @@ frigate/config/config.py
 
 The following improvements are planned for future iterations:
 
-1. **TLS / CURVE authentication** — add ZMQ CURVE so only authorised Frigate instances can connect; prevents untrusted clients from submitting arbitrary tensors.
+1. **TLS / CURVE authentication** — add ZMQ CURVE so only authorized Frigate instances can connect; prevents untrusted clients from submitting arbitrary tensors.
 
 2. **Multi-model concurrency** — switch the ZMQ socket from REQ/REP (lockstep) to ROUTER/DEALER to process multiple cameras in parallel on a single server, reducing latency for multi-camera setups.
 
