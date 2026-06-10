@@ -131,6 +131,8 @@ python -m inference_server [options]
 | `--model-dir` | `~/.frigate-inference/models` | Directory to cache received models |
 | `--device` | `auto` | `auto`, `cuda`, `directml`, `rocm`, `cpu` |
 | `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `--health-port` | `5556` | HTTP health endpoint port; set to `0` to disable |
+| `--workers` | `4` | Number of concurrent inference worker threads |
 
 All options can also be set via environment variables:
 
@@ -140,6 +142,8 @@ All options can also be set via environment variables:
 | `INFERENCE_MODEL_DIR` | `--model-dir` |
 | `INFERENCE_DEVICE` | `--device` |
 | `INFERENCE_LOG_LEVEL` | `--log-level` |
+| `INFERENCE_HEALTH_PORT` | `--health-port` |
+| `INFERENCE_WORKERS` | `--workers` |
 
 ---
 
@@ -203,6 +207,120 @@ sudo systemctl status frigate-inference
 2. Trigger: **At system startup**
 3. Action: **Start a program** → `C:\path\to\inference_server\start.bat`
 4. Check **Run whether user is logged on or not**
+
+### Windows (Service — recommended)
+
+The `install_service.bat` script installs the server as a proper Windows service that starts automatically at boot and restarts on failure.
+
+```bat
+# Run as Administrator
+install_service.bat
+
+# Custom options
+install_service.bat --name FrigateInference --endpoint "tcp://*:5555" --device cuda --workers 8
+
+# Remove the service
+install_service.bat --remove
+```
+
+For best results, install [NSSM](https://nssm.cc/download) (Non-Sucking Service Manager) and add it to `PATH` before running the script. NSSM provides automatic restart on failure, stdout/stderr log files with rotation, and more reliable service lifecycle management than the `sc.exe` fallback.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--name` | `FrigateInference` | Windows service name |
+| `--endpoint` | `tcp://*:5555` | ZMQ bind address |
+| `--device` | `auto` | `auto`, `cuda`, `directml`, `cpu` |
+| `--health-port` | `5556` | HTTP health port (`0` = disabled) |
+| `--workers` | `4` | Inference worker threads |
+| `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `--remove` | — | Uninstall the service |
+
+---
+
+## Concurrent Inference
+
+The server uses a ZMQ **ROUTER/DEALER** architecture backed by a thread pool, so multiple cameras can submit inference requests simultaneously without queuing behind each other.
+
+```
+Frigate cameras ──► ROUTER (tcp/:5555) ──► DEALER (inproc)
+                                                │
+                              ┌─────────────────┼──────────────────┐
+                              │                 │                  │
+                         Worker 1          Worker 2  …         Worker N
+                        (REP socket)      (REP socket)        (REP socket)
+                       ONNX Runtime      ONNX Runtime        ONNX Runtime
+```
+
+Each worker thread owns its own ZMQ REP socket. Adjust the number of workers with `--workers` (default: 4). For GPU inference, the ONNX Runtime handles its own internal parallelism, so 4–8 workers is usually sufficient. For CPU-only setups, match `--workers` to your core count.
+
+---
+
+## Health Endpoint
+
+When `--health-port` is set to a non-zero value (default: 5556), the server starts an HTTP server with three endpoints:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | Full status: uptime, request counts, mean latency, loaded models |
+| `GET /health/ready` | `200` if at least one model is loaded; `503` otherwise |
+| `GET /health/live` | Always `200` while the process is running |
+
+Example response from `GET /health`:
+
+```json
+{
+  "status": "ok",
+  "uptime_s": 123.4,
+  "requests_total": 5000,
+  "inference_total": 4980,
+  "mean_latency_ms": 8.31,
+  "loaded_models": ["my_model.onnx"]
+}
+```
+
+The health endpoint requires `fastapi` and `uvicorn` to be installed. The server starts normally without them, but health checks will be unavailable.
+
+```bash
+pip install fastapi "uvicorn[standard]"
+```
+
+Disable the health endpoint:
+
+```bash
+python -m inference_server --health-port 0
+```
+
+Also open port 5556 in your firewall if you want to monitor the server from another machine:
+
+```bash
+sudo ufw allow 5556/tcp
+```
+
+---
+
+## Hot-Swap Models
+
+You can replace a loaded model without restarting the server. Send a `model_reload` ZMQ message from a Frigate client or custom script:
+
+```python
+import zmq, json
+
+ctx = zmq.Context()
+sock = ctx.socket(zmq.REQ)
+sock.connect("tcp://192.168.1.50:5555")
+
+with open("new_model.onnx", "rb") as f:
+    model_bytes = f.read()
+
+sock.send_multipart([
+    json.dumps({"model_reload": True, "model_name": "new_model.onnx"}).encode(),
+    model_bytes,
+])
+reply = json.loads(sock.recv_multipart()[0])
+print(reply)  # {"reloaded": true, "model_name": "new_model.onnx"}
+```
+
+In-flight inference requests using the old model complete normally before the new model takes over.
 
 ---
 
@@ -296,25 +414,27 @@ When Frigate connects to the ZMQ server, it automatically transfers the model fi
 
 ```
 inference_server/
-├── __init__.py          # Package marker
-├── __main__.py          # CLI entry point (python -m inference_server)
-├── config.py            # ServerConfig (CLI args + env vars)
-├── server.py            # ZMQ REP server main loop
-├── model_store.py       # Disk-based model cache + runner management
+├── __init__.py             # Package marker
+├── __main__.py             # CLI entry point (python -m inference_server)
+├── config.py               # ServerConfig (CLI args + env vars)
+├── server.py               # ROUTER/DEALER concurrent ZMQ server
+├── health.py               # FastAPI HTTP health endpoint
+├── model_store.py          # Disk-based model cache + runner management
 ├── runners/
 │   ├── __init__.py
-│   ├── onnx_runner.py   # ONNX Runtime with GPU/CPU EP auto-selection
-│   └── post_process.py  # Post-processing (YOLOX, DFINE, RFDETR, etc.)
-├── requirements.txt     # Dependency reference
-├── install.sh           # Linux installer
-├── install.bat          # Windows installer
-└── README.md            # This file
+│   ├── onnx_runner.py      # ONNX Runtime with GPU/CPU EP auto-selection
+│   └── post_process.py     # Post-processing (YOLOX, DFINE, RFDETR, etc.)
+├── requirements.txt        # Dependency reference
+├── install.sh              # Linux installer
+├── install.bat             # Windows installer
+├── install_service.bat     # Windows service installer (run as Administrator)
+└── README.md               # This file
 
 frigate/detectors/plugins/
-└── fallback.py          # Fallback/priority detector plugin (Frigate-side)
+└── fallback.py             # Fallback/priority detector plugin (Frigate-side)
 
 frigate/config/config.py
-└── (modified)           # Wires fallback detector references at config validation
+└── (modified)              # Wires fallback detector references at config validation
 ```
 
 ---
@@ -325,20 +445,20 @@ The following improvements are planned for future iterations:
 
 1. **TLS / CURVE authentication** — add ZMQ CURVE so only authorized Frigate instances can connect; prevents untrusted clients from submitting arbitrary tensors.
 
-2. **Multi-model concurrency** — switch the ZMQ socket from REQ/REP (lockstep) to ROUTER/DEALER to process multiple cameras in parallel on a single server, reducing latency for multi-camera setups.
+2. ~~**Multi-model concurrency**~~ ✅ — ROUTER/DEALER with `--workers` thread pool (see [Concurrent Inference](#concurrent-inference)).
 
-3. **Health endpoint** — expose a lightweight HTTP endpoint (e.g. FastAPI on port 5556) that returns server status, loaded models, inference latency, and GPU utilisation; makes monitoring and dashboards easy.
+3. ~~**Health endpoint**~~ ✅ — FastAPI on `--health-port` with `/health`, `/health/ready`, `/health/live` (see [Health Endpoint](#health-endpoint)).
 
 4. **Metrics / Prometheus** — emit `prometheus_client` metrics (inference latency histogram, frames/sec, model load times) for Grafana dashboards.
 
-5. **Windows service installer** — wrap `start.bat` as a proper Windows service using `pywin32` or NSSM, so the server survives reboots without Task Scheduler.
+5. ~~**Windows service installer**~~ ✅ — `install_service.bat` with NSSM support (see [Windows Service](#windows-service--recommended)).
 
 6. **Docker image** — provide a `Dockerfile.inference-server` so the server can run as a container alongside Nvidia Container Toolkit or ROCm Docker on Linux.
 
-7. **Dynamic model hot-swap** — allow the server to accept a new model file and swap it in without restarting, for zero-downtime model updates.
+7. ~~**Dynamic model hot-swap**~~ ✅ — zero-downtime model reload via `model_reload` ZMQ message (see [Hot-Swap Models](#hot-swap-models)).
 
 8. **Batch inference** — buffer multiple camera frames and run them as a single batch through the GPU for better throughput on multi-camera systems.
 
 9. **ROCm / HIP runner** — add an explicit `rocm_runner.py` that uses the MIGraphX execution provider and handles ROCm-specific quirks (currently handled via generic ORT auto-detection).
 
-10. **Model quantisation helper** — add a utility script that takes an FP32 ONNX model and converts it to INT8/FP16 using ORT quantisation tools, providing a further speed boost for GPU inference.
+10. **Model quantization helper** — add a utility script that takes an FP32 ONNX model and converts it to INT8/FP16 using ORT quantization tools, providing a further speed boost for GPU inference.

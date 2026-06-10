@@ -12,6 +12,8 @@ class ServerConfig:
         model_dir: str | None = None,
         device: str | None = None,
         log_level: str | None = None,
+        health_port: int | None = None,
+        workers: int | None = None,
     ) -> None:
         self.endpoint: str = endpoint or os.environ.get(
             "INFERENCE_ENDPOINT", "tcp://*:5555"
@@ -26,3 +28,13 @@ class ServerConfig:
         self.log_level: str = (
             log_level or os.environ.get("INFERENCE_LOG_LEVEL", "info")
         ).upper()
+
+        # Health endpoint port (0 = disabled)
+        _health_port_env = os.environ.get("INFERENCE_HEALTH_PORT", "5556")
+        self.health_port: int = (
+            health_port if health_port is not None else int(_health_port_env)
+        )
+
+        # Number of inference worker threads for ROUTER/DEALER concurrency
+        _workers_env = os.environ.get("INFERENCE_WORKERS", "4")
+        self.workers: int = workers if workers is not None else int(_workers_env)

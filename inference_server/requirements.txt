@@ -5,6 +5,11 @@ pyzmq>=25.0
 numpy>=1.24
 opencv-python-headless>=4.8   # provides cv2.dnn.NMSBoxes for post-processing
 
+# Optional: HTTP health endpoint (GET /health, GET /health/ready, GET /health/live)
+# Install these to enable the --health-port option:
+# fastapi>=0.100
+# uvicorn[standard]>=0.23
+
 # ONNX Runtime — choose ONE of the variants below depending on your hardware:
 #
 #   CPU only (any platform):
