@@ -1,0 +1,148 @@
+"""Disk-based model cache for the remote inference server."""
+
+import logging
+import os
+import threading
+
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+class ModelStore:
+    """Manages saving, loading, and caching of ONNX model files.
+
+    Models are stored on disk under ``model_dir`` and loaded into an
+    ONNX-based runner on demand.  The store is also responsible for
+    creating and returning a :class:`~inference_server.runners.onnx_runner.OnnxRunner`
+    for each model.
+
+    Thread-safety notes
+    -------------------
+    ``_runners`` is a plain ``dict`` accessed from multiple worker threads.
+    Under CPython the GIL makes individual ``dict`` operations (``get``,
+    assignment) effectively atomic, so workers reading ``_runners.get()``
+    concurrently with a hot-swap ``save_and_load`` assignment are safe.
+    However, iterating over ``_runners`` while another thread may add a key
+    is **not** safe without a lock.  Use :meth:`loaded_model_names` (which
+    takes a snapshot inside a lock) whenever you need to enumerate keys.
+    During a hot-swap a worker may still hold a reference to the *old*
+    runner; that is intentional — in-flight requests complete normally
+    before the old runner is garbage-collected.
+    """
+
+    def __init__(self, model_dir: str, device: str) -> None:
+        self._model_dir = model_dir
+        self._device = device
+        # name -> OnnxRunner instance; guarded by _runners_lock for iteration
+        self._runners: dict[str, object] = {}
+        self._runners_lock = threading.Lock()
+        os.makedirs(model_dir, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+
+    def _safe_model_name(self, model_name: str) -> str:
+        """Return a sanitized filename, rejecting any path-traversal attempts.
+
+        Only the basename is kept.  Raises ``ValueError`` if the sanitized name
+        is empty or attempts to escape ``model_dir``.
+        """
+        safe = os.path.basename(model_name)
+        if not safe:
+            raise ValueError(f"Invalid model name: {model_name!r}")
+        resolved = os.path.realpath(os.path.join(self._model_dir, safe))
+        if not resolved.startswith(os.path.realpath(self._model_dir) + os.sep):
+            raise ValueError(f"Path traversal detected for model name: {model_name!r}")
+        return safe
+
+    def model_path(self, model_name: str) -> str:
+        return os.path.join(self._model_dir, self._safe_model_name(model_name))
+
+    def is_available(self, model_name: str) -> bool:
+        try:
+            return os.path.isfile(self.model_path(model_name))
+        except ValueError:
+            return False
+
+    def is_loaded(self, model_name: str) -> bool:
+        return model_name in self._runners
+
+    def loaded_model_names(self) -> list[str]:
+        """Return a snapshot of currently loaded model names.
+
+        Thread-safe: acquires the iteration lock before copying the keys.
+        """
+        with self._runners_lock:
+            return list(self._runners.keys())
+
+    def save_and_load(self, model_name: str, model_bytes: bytes) -> bool:
+        """Persist *model_bytes* to disk and load it into a runner.
+
+        Returns True on success, False on any failure.
+        """
+        try:
+            path = self.model_path(model_name)
+        except ValueError as exc:
+            logger.error("Rejected unsafe model name: %s", exc)
+            return False
+
+        try:
+            with open(path, "wb") as fh:
+                fh.write(model_bytes)
+            logger.info("Saved model %s (%d bytes)", model_name, len(model_bytes))
+        except OSError as exc:
+            logger.error("Failed to save model %s: %s", model_name, exc)
+            return False
+
+        return self._load(model_name, path)
+
+    def load_from_disk(self, model_name: str) -> bool:
+        """Load a previously saved model from disk.
+
+        Returns True on success, False if the file does not exist or loading fails.
+        """
+        try:
+            path = self.model_path(model_name)
+        except ValueError as exc:
+            logger.error("Rejected unsafe model name: %s", exc)
+            return False
+
+        if not os.path.isfile(path):
+            return False
+        return self._load(model_name, path)
+
+    def run(
+        self, model_name: str, tensor_input: np.ndarray, model_type: str
+    ) -> np.ndarray:
+        """Run inference and return a (20, 6) float32 detection array."""
+        runner = self._runners.get(model_name)
+        if runner is None:
+            raise RuntimeError(f"Model {model_name!r} is not loaded")
+        return runner.run(tensor_input, model_type)
+
+    def preload_all(self) -> None:
+        """Load every model file already present in ``model_dir``."""
+        for fname in os.listdir(self._model_dir):
+            if fname.endswith(".onnx"):
+                self.load_from_disk(fname)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _load(self, model_name: str, path: str) -> bool:
+        # Import here so that the store module doesn't hard-depend on
+        # onnxruntime at import time (simplifies unit testing).
+        from inference_server.runners.onnx_runner import OnnxRunner
+
+        try:
+            runner = OnnxRunner(path, self._device)
+            with self._runners_lock:
+                self._runners[model_name] = runner
+            logger.info("Loaded model %s on device=%s", model_name, self._device)
+            return True
+        except Exception as exc:
+            logger.error("Failed to load model %s: %s", model_name, exc)
+            return False
